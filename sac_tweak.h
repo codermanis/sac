@@ -25,6 +25,8 @@ typedef const char* char_ptr;
 
 #ifdef __cplusplus
 extern "C" {
+#else
+#include <stdbool.h>
 #endif
 
 /* Public API */
@@ -40,24 +42,25 @@ enum __sac_tweak_type {
        TWEAK(char_ptr, my_string) = "hello";
     Note: use char_ptr because char* will break macro expansions.
 */
-#define TWEAK(T, name) static T __SAC_UNIQUE_NAME; static int __SAC_UNIQUE_ID = __sac_tweak_init(#name, __FILE__, type_##T); T name = __sac_tweak_##T(#name, __FILE__, __SAC_UNIQUE_ID, __SAC_UNIQUE_NAME); __SAC_UNIQUE_NAME
+#define TWEAK(T, name) int __SAC_UNIQUE_ID = __sac_tweak_init(#name, __FILE__, type_##T); T name = __sac_tweak_##T(#name, __FILE__, __SAC_UNIQUE_ID); dummy_##T
 
 
 
 /* Private macro foo */
-#define __SAC_MERGE_(a,b)  a##b
-#define __SAC_LABEL_(a, b) __SAC_MERGE_(a, b)
-#define __SAC_UNIQUE_NAME __SAC_LABEL_(__SAC_unique_name_, __LINE__)
-#define __SAC_UNIQUE_ID __SAC_LABEL_(id_, __LINE__)
-
+#define __SAC_MERGE_(a, b, c)  a##b##c
+#define __SAC_LABEL_(a, b, c) __SAC_MERGE_(a, b, c)
+#define __SAC_UNIQUE_ID __SAC_LABEL_(id_, __LINE__, __FUNCTION__)
 
 
 extern int __sac_tweak_init(const char* name, const char* file, enum __sac_tweak_type type);
 
-extern float __sac_tweak_float(const char* name, const char* file, int id, float);
-extern int   __sac_tweak_int(const char* name, const char* file, int id, int);
-extern char* __sac_tweak_char_ptr(const char* name, const char* file, int id, const char*);
+extern float __sac_tweak_float(const char* name, const char* file, int id);
+extern int   __sac_tweak_int(const char* name, const char* file, int id);
+extern char* __sac_tweak_char_ptr(const char* name, const char* file, int id);
 
+extern int dummy_int;
+extern float dummy_float;
+extern char_ptr dummy_char_ptr;
 
 #ifdef SAC_TWEAK_IMPLEMENTATION
 
@@ -71,13 +74,6 @@ extern char* __sac_tweak_char_ptr(const char* name, const char* file, int id, co
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
-
-
-union __sac_tweak_value {
-    int i;
-    float f;
-    char* s;
-};
 
 struct __sac_tweak_datas {
     int watch;
@@ -196,15 +192,15 @@ static void __sac_update_tweak(int id) {
                     datas->tweaks[id].value.f = val;
                 }
             } break;
-            case type_char_ptr:
+            case type_char_ptr: {
                 const char* start = strchr(raw, '"');
                 datas->tweaks[id].value.s = strndup(start + 1, strlen(start) - 2);
-                break;
+            } break;
         }
     }
 }
 
-static void* __sac_update_loop(void*);
+static void* __sac_update_loop(void* args);
 
 static bool __sac_tweak_global_init() {
     datas = (struct __sac_global_datas*) malloc(sizeof(struct __sac_global_datas));
@@ -266,7 +262,7 @@ int __sac_tweak_init(const char* name, const char* file, enum __sac_tweak_type t
     return id;
 }
 
-static void* __sac_update_loop(void*) {
+static void* __sac_update_loop(void* args) {
     fd_set fds;
     int nfds;
     char buffer[sizeof(struct inotify_event)];
@@ -301,26 +297,30 @@ static void* __sac_update_loop(void*) {
     }
 }
 
-float __sac_tweak_float(const char* name, const char* file, int id, float) {
+float __sac_tweak_float(const char* name, const char* file, int id) {
     pthread_mutex_lock(&__sac_fastmutex);
     float result = datas->tweaks[id].value.f;
     pthread_mutex_unlock(&__sac_fastmutex);
     return result;
 }
 
-int __sac_tweak_int(const char* name, const char* file, int id, int) {
+int __sac_tweak_int(const char* name, const char* file, int id) {
     pthread_mutex_lock(&__sac_fastmutex);
     int result = datas->tweaks[id].value.i;
     pthread_mutex_unlock(&__sac_fastmutex);
     return result;
 }
 
-char* __sac_tweak_char_ptr(const char* name, const char* file, int id, const char*) {
+char* __sac_tweak_char_ptr(const char* name, const char* file, int id) {
     pthread_mutex_lock(&__sac_fastmutex);
     char* result = datas->tweaks[id].value.s;
     pthread_mutex_unlock(&__sac_fastmutex);
     return result;
 }
+
+int dummy_int;
+float dummy_float;
+char_ptr dummy_char_ptr;
 
 #endif /* SAC_TWEAK_IMPLEMENTATION */
 
