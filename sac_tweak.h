@@ -44,6 +44,17 @@ enum __sac_tweak_type {
 */
 #define TWEAK(T, name) int __SAC_UNIQUE_ID = __sac_tweak_init(#name, __FILE__, type_##T); T name = __sac_tweak_##T(#name, __FILE__, __SAC_UNIQUE_ID); dummy_##T
 
+/* Call this to override default value of tweaks. Default prefix is --t_ so using the same examples as above:
+       --t_my_int=3
+       --t_my_float_var=1.2
+       --t_my_string=hello
+    You can replace the prefix by defining TWEAK_ARG_PREFIX
+*/
+void tweak_consume_command_line_args(int argc, char** argv);
+
+#ifndef TWEAK_ARG_PREFIX
+#define TWEAK_ARG_PREFIX "--t_"
+#endif
 
 
 /* Private macro foo */
@@ -87,6 +98,11 @@ struct __sac_tweak_datas {
     } value;
 };
 
+struct __sac_tweak_default_value {
+    const char* name;
+    const char* value;
+};
+
 #define __SAC_MAX_TWEAKS 1024
 static struct __sac_global_datas {
     pthread_t th;
@@ -94,6 +110,8 @@ static struct __sac_global_datas {
     struct __sac_tweak_datas tweaks[__SAC_MAX_TWEAKS];
     int tweak_count;
     int self_pipe[2];
+    int default_count;
+    struct __sac_tweak_default_value* defaults;
 }* datas;
 
 static pthread_mutex_t __sac_fastmutex = PTHREAD_MUTEX_INITIALIZER;
@@ -174,8 +192,8 @@ static const char* __sac_read_value_from_file(const char* name, const char* file
     return result;
 }
 
-static void __sac_update_tweak(int id) {
-    const char* raw = __sac_read_value_from_file(datas->tweaks[id].name, datas->tweaks[id].filename);
+static void __sac_update_tweak(int id, char* value) {
+    const char* raw = value ? value : __sac_read_value_from_file(datas->tweaks[id].name, datas->tweaks[id].filename);
     if (raw) {
         switch (datas->tweaks[id].type) {
             case type_int: {
@@ -193,8 +211,14 @@ static void __sac_update_tweak(int id) {
                 }
             } break;
             case type_char_ptr: {
+                const size_t len = strlen(raw);
                 const char* start = strchr(raw, '"');
-                datas->tweaks[id].value.s = strndup(start + 1, strlen(start) - 2);
+                /* strip quotes */
+                if (start && len && raw[len-1] == '"') {
+                    datas->tweaks[id].value.s = strndup(start + 1, strlen(start) - 2);
+                } else {
+                    datas->tweaks[id].value.s = strdup(raw);
+                }
             } break;
         }
     }
@@ -221,6 +245,9 @@ static bool __sac_tweak_global_init() {
         goto error_thread;
     }
     pthread_detach(datas->th);
+
+    datas->default_count = 0;
+    datas->defaults = NULL;
 
     return true;
 
@@ -257,9 +284,48 @@ int __sac_tweak_init(const char* name, const char* file, enum __sac_tweak_type t
     datas->tweaks[id].filename = file;
     datas->tweaks[id].type = type;
 
-    __sac_update_tweak(id);
+    const char* default_value = NULL;
+    for (int i=0; i<datas->default_count; i++) {
+        if (strcmp(datas->defaults[i].name, name) == 0) {
+            default_value = datas->defaults[i].value;
+        }
+    }
+    __sac_update_tweak(id, default_value);
     pthread_mutex_unlock(&__sac_fastmutex);
     return id;
+}
+
+void tweak_consume_command_line_args(int argc, char** argv) {
+    if (!datas) {
+        if (!__sac_tweak_global_init()) {
+            return;
+        }
+    }
+
+    int count = 0;
+    const size_t prefix_len = strlen(TWEAK_ARG_PREFIX);
+    /* clone argument with for form '--XXXXX=XXXX' */
+    for (int i=0; i<argc; i++) {
+        size_t len = strlen(argv[i]);
+        if (len <= prefix_len) {
+            continue;
+        }
+        if (memcmp(argv[i], TWEAK_ARG_PREFIX, prefix_len) != 0) {
+            continue;
+        }
+
+        const char* equal = strchr(&argv[i][prefix_len], '=');
+        if (equal == NULL) {
+            continue;
+        }
+        datas->defaults = (struct __sac_tweak_default_value*) realloc(
+            datas->defaults,
+            (1 + count) * sizeof(struct __sac_tweak_default_value));
+        datas->defaults[count].name = strndup(&argv[i][prefix_len], equal - argv[i] - prefix_len);
+        datas->defaults[count].value = strdup(equal + 1);
+        count++;
+    }
+    datas->default_count = count;
 }
 
 static void* __sac_update_loop(void* args) {
@@ -287,7 +353,7 @@ static void* __sac_update_loop(void* args) {
 
                 for (int j=0; j<datas->tweak_count; j++) {
                     if (datas->tweaks[j].watch == event->wd) {
-                        __sac_update_tweak(j);
+                        __sac_update_tweak(j, NULL);
                     }
                 }
 
