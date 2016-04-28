@@ -42,7 +42,7 @@ enum __sac_tweak_type {
        TWEAK(char_ptr, my_string) = "hello";
     Note: use char_ptr because char* will break macro expansions.
 */
-#define TWEAK(T, name) int __SAC_UNIQUE_ID = __sac_tweak_init(#name, __FILE__, type_##T); T name = __sac_tweak_##T(#name, __FILE__, __SAC_UNIQUE_ID); dummy_##T
+#define TWEAK(T, name) T name; if (!__sac_tweak_##T(#name, __FILE__, __sac_tweak_id(#name, __FILE__, type_##T, __SAC_XSTR(__SAC_LABEL(__FUNCTION__, __LINE__, _id))), &name)) name
 
 /* Call this to override default value of tweaks. Default prefix is --t_ so using the same examples as above:
        --t_my_int=3
@@ -59,19 +59,16 @@ void tweak_consume_command_line_args(int argc, char** argv);
 
 /* Private macro foo */
 #define __SAC_MERGE_(a, b, c)  a##b##c
-#define __SAC_LABEL_(a, b, c) __SAC_MERGE_(a, b, c)
-#define __SAC_UNIQUE_ID __SAC_LABEL_(id_, __LINE__, __FUNCTION__)
+#define __SAC_LABEL(a, b, c) __SAC_MERGE_(a, b, c)
+#define __SAC_STR(s) #s
+#define __SAC_XSTR(s) __SAC_STR(s)
 
 
-extern int __sac_tweak_init(const char* name, const char* file, enum __sac_tweak_type type);
+extern int __sac_tweak_id(const char* name, const char* file, enum __sac_tweak_type type, const char* id);
 
-extern float __sac_tweak_float(const char* name, const char* file, int id);
-extern int   __sac_tweak_int(const char* name, const char* file, int id);
-extern char* __sac_tweak_char_ptr(const char* name, const char* file, int id);
-
-extern int dummy_int;
-extern float dummy_float;
-extern char_ptr dummy_char_ptr;
+extern bool __sac_tweak_float(const char* name, const char* file, int id, float* out);
+extern bool   __sac_tweak_int(const char* name, const char* file, int id, int* out);
+extern bool __sac_tweak_char_ptr(const char* name, const char* file, int id, const char** out);
 
 #ifdef SAC_TWEAK_IMPLEMENTATION
 
@@ -88,6 +85,7 @@ extern char_ptr dummy_char_ptr;
 
 struct __sac_tweak_datas {
     int watch;
+    const char* unique_id;
     const char* name;
     const char* filename;
     enum __sac_tweak_type type;
@@ -96,6 +94,7 @@ struct __sac_tweak_datas {
         float f;
         char* s;
     } value;
+    bool is_valid;
 };
 
 struct __sac_tweak_default_value {
@@ -192,7 +191,7 @@ static const char* __sac_read_value_from_file(const char* name, const char* file
     return result;
 }
 
-static void __sac_update_tweak(int id, char* value) {
+static void __sac_update_tweak(int id, const char* value) {
     const char* raw = value ? value : __sac_read_value_from_file(datas->tweaks[id].name, datas->tweaks[id].filename);
     if (raw) {
         switch (datas->tweaks[id].type) {
@@ -201,6 +200,7 @@ static void __sac_update_tweak(int id, char* value) {
                 long val = strtol(raw, &endptr, 0);
                 if (endptr != raw) {
                     datas->tweaks[id].value.i = (int)val;
+                    datas->tweaks[id].is_valid = true;
                 }
             } break;
             case type_float: {
@@ -208,6 +208,7 @@ static void __sac_update_tweak(int id, char* value) {
                 float val = strtof(raw, &endptr);
                 if (endptr != raw) {
                     datas->tweaks[id].value.f = val;
+                    datas->tweaks[id].is_valid = true;
                 }
             } break;
             case type_char_ptr: {
@@ -216,8 +217,10 @@ static void __sac_update_tweak(int id, char* value) {
                 /* strip quotes */
                 if (start && len && raw[len-1] == '"') {
                     datas->tweaks[id].value.s = strndup(start + 1, strlen(start) - 2);
+                    datas->tweaks[id].is_valid = true;
                 } else {
                     datas->tweaks[id].value.s = strdup(raw);
+                    datas->tweaks[id].is_valid = true;
                 }
             } break;
         }
@@ -263,14 +266,22 @@ error_malloc:
 
 }
 
-int __sac_tweak_init(const char* name, const char* file, enum __sac_tweak_type type) {
+int __sac_tweak_id(const char* name, const char* file, enum __sac_tweak_type type, const char* unique_id) {
     pthread_mutex_lock(&__sac_fastmutex);
     if (!datas) {
         if (!__sac_tweak_global_init()) {
             pthread_mutex_unlock(&__sac_fastmutex);
-            return 0;
+            return -1;
         }
     }
+
+    for (int i=0; i<datas->tweak_count; i++) {
+        if (strcmp(unique_id, datas->tweaks[i].unique_id) == 0) {
+            pthread_mutex_unlock(&__sac_fastmutex);
+            return i;
+        }
+    }
+
     /* unblock select */
     write(datas->self_pipe[1], "a", 1);
 
@@ -279,10 +290,12 @@ int __sac_tweak_init(const char* name, const char* file, enum __sac_tweak_type t
         pthread_mutex_unlock(&__sac_fastmutex);
         return 0;
     }
+    datas->tweaks[id].unique_id = unique_id;
     datas->tweaks[id].watch = inotify_add_watch(datas->fd, file, IN_CLOSE_WRITE);
     datas->tweaks[id].name = name;
     datas->tweaks[id].filename = file;
     datas->tweaks[id].type = type;
+    datas->tweaks[id].is_valid = false;
 
     const char* default_value = NULL;
     for (int i=0; i<datas->default_count; i++) {
@@ -363,30 +376,45 @@ static void* __sac_update_loop(void* args) {
     }
 }
 
-float __sac_tweak_float(const char* name, const char* file, int id) {
+bool __sac_tweak_float(const char* name, const char* file, int id, float* out) {
+    if (id < 0) {
+        return false;
+    }
     pthread_mutex_lock(&__sac_fastmutex);
-    float result = datas->tweaks[id].value.f;
+    const bool is_valid = datas->tweaks[id].is_valid;
+    if (is_valid) {
+        *out = datas->tweaks[id].value.f;
+    }
     pthread_mutex_unlock(&__sac_fastmutex);
-    return result;
+    return is_valid;
 }
 
-int __sac_tweak_int(const char* name, const char* file, int id) {
+bool __sac_tweak_int(const char* name, const char* file, int id, int* out) {
+    if (id < 0) {
+        return false;
+    }
     pthread_mutex_lock(&__sac_fastmutex);
-    int result = datas->tweaks[id].value.i;
+    const bool is_valid = datas->tweaks[id].is_valid;
+    if (is_valid) {
+        *out = datas->tweaks[id].value.i;
+    }
     pthread_mutex_unlock(&__sac_fastmutex);
-    return result;
+    return is_valid;
 }
 
-char* __sac_tweak_char_ptr(const char* name, const char* file, int id) {
+bool __sac_tweak_char_ptr(const char* name, const char* file, int id, const char** out) {
+    if (id < 0) {
+        return false;
+    }
     pthread_mutex_lock(&__sac_fastmutex);
-    char* result = datas->tweaks[id].value.s;
-    pthread_mutex_unlock(&__sac_fastmutex);
-    return result;
-}
+    const bool is_valid = datas->tweaks[id].is_valid;
+    if (is_valid) {
+        *out = datas->tweaks[id].value.s;
+    }
 
-int dummy_int;
-float dummy_float;
-char_ptr dummy_char_ptr;
+    pthread_mutex_unlock(&__sac_fastmutex);
+    return is_valid;
+}
 
 #endif /* SAC_TWEAK_IMPLEMENTATION */
 
